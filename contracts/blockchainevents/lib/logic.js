@@ -1,7 +1,3 @@
-'use strict';
-/**
- * Write your transction processor functions here
- */
 /*
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,173 +11,288 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-var NS = 'org.acme.product.auction';
+
 /**
- * Close the bidding for product listing and choose the
- * highest bid that is over the asking price
- * @param {org.acme.product.auction.CloseBidding} closeBidding - the closeBidding transaction
+ * A shipment has been received by an importer
+ * @param {org.acme.shipping.perishable.ShipmentReceived} shipmentReceived - the ShipmentReceived transaction
  * @transaction
  */
-function closeBidding(closeBidding) {
-  var listing = closeBidding.listing;
-  if(listing.state !== 'FOR_SALE') {
-    throw new Error('Listing is not FOR SALE');
-  }
-  // by default we mark the listing as RESERVE_NOT_MET
-  listing.state = 'RESERVE_NOT_MET';
-  var oldOwner = listing.product.owner.email;
-  var highestOffer = null;
-  var buyer = null;
-  var seller = listing.product.owner;
-  if(listing.offers && listing.offers.length > 0) {
-    // sort the bids by bidPrice
-    listing.offers.sort(function(a, b) {
-      return(b.bidPrice - a.bidPrice);
+function payOut(shipmentReceived) {
+
+    var contract = shipmentReceived.shipment.contract;
+    var shipment = shipmentReceived.shipment;
+    var payOut = contract.unitPrice * shipment.unitCount;
+
+    //console.log('Received at: ' + shipmentReceived.timestamp);
+    //console.log('Contract arrivalDateTime: ' + contract.arrivalDateTime);
+
+    // set the status of the shipment
+    shipment.status = 'ARRIVED';
+
+    // if the shipment did not arrive on time the payout is zero
+    if (shipmentReceived.timestamp > contract.arrivalDateTime) {
+        payOut = 0;
+        //console.log('Late shipment');
+    } else {
+        // find the lowest temperature reading
+        if (shipment.temperatureReadings) {
+            // sort the temperatureReadings by celsius
+            shipment.temperatureReadings.sort(function (a, b) {
+                return (a.celsius - b.celsius);
+            });
+            var lowestReading = shipment.temperatureReadings[0];
+            var highestReading = shipment.temperatureReadings[shipment.temperatureReadings.length - 1];
+            var penalty = 0;
+            //console.log('Lowest temp reading: ' + lowestReading.celsius);
+            //console.log('Highest temp reading: ' + highestReading.celsius);
+
+            // does the lowest temperature violate the contract?
+            if (lowestReading.celsius < contract.minTemperature) {
+                penalty += (contract.minTemperature - lowestReading.celsius) * contract.minPenaltyFactor;
+                //console.log('Min temp penalty: ' + penalty);
+            }
+
+            // does the highest temperature violate the contract?
+            if (highestReading.celsius > contract.maxTemperature) {
+                penalty += (highestReading.celsius - contract.maxTemperature) * contract.maxPenaltyFactor;
+                //console.log('Max temp penalty: ' + penalty);
+            }
+
+            // apply any penalities
+            payOut -= (penalty * shipment.unitCount);
+
+            if (payOut < 0) {
+                payOut = 0;
+            }
+        }
+    }
+
+    //console.log('Payout: ' + payOut);
+    contract.grower.accountBalance += payOut;
+    contract.importer.accountBalance -= payOut;
+
+    //console.log('Grower: ' + contract.grower.$identifier + ' new balance: ' + contract.grower.accountBalance);
+    //console.log('Importer: ' + contract.importer.$identifier + ' new balance: ' + contract.importer.accountBalance);
+
+    return getParticipantRegistry('org.acme.shipping.perishable.Grower')
+        .then(function (growerRegistry) {
+            // update the grower's balance
+            return growerRegistry.update(contract.grower);
+        })
+        .then(function () {
+            return getParticipantRegistry('org.acme.shipping.perishable.Importer');
+        })
+        .then(function (importerRegistry) {
+            // update the importer's balance
+            return importerRegistry.update(contract.importer);
+        })
+        .then(function () {
+            return getAssetRegistry('org.acme.shipping.perishable.Shipment');
+        })
+        .then(function (shipmentRegistry) {
+            // update the state of the shipment
+            return shipmentRegistry.update(shipment);
+        });
+}
+
+/**
+ * A temperature reading has been received for a shipment
+ * @param {org.acme.shipping.perishable.TemperatureReading} temperatureReading - the TemperatureReading transaction
+ * @transaction
+ */
+function temperatureReading(temperatureReading) {
+
+    var shipment = temperatureReading.shipment;
+    var NS = 'org.acme.shipping.perishable';
+    var contract = shipment.contract;
+    var factory = getFactory();
+
+    //console.log('Adding temperature ' + temperatureReading.celsius + ' to shipment ' + shipment.$identifier);
+
+    if (shipment.temperatureReadings) {
+        shipment.temperatureReadings.push(temperatureReading);
+    } else {
+        shipment.temperatureReadings = [temperatureReading];
+    }
+
+    if (temperatureReading.celsius < contract.minTemperature ||
+        temperatureReading.celsius > contract.maxTemperature) {
+        var temperatureEvent = factory.newEvent(NS, 'TemperatureThresholdEvent');
+        temperatureEvent.shipment = shipment;
+        temperatureEvent.temperature = temperatureReading.celsius;
+        temperatureEvent.latitude = temperatureReading.latitude;
+        temperatureEvent.longitude = temperatureReading.longitude;
+        temperatureEvent.readingTime = temperatureReading.readingTime;
+        temperatureEvent.message = 'Temperature threshold violated! Emitting TemperatureEvent for shipment: ' + shipment.$identifier;
+        emit(temperatureEvent);
+    }
+
+    return getAssetRegistry(NS + '.Shipment')
+        .then(function (shipmentRegistry) {
+            // add the temp reading to the shipment
+            return shipmentRegistry.update(shipment);
+        });
+}
+
+/**
+ * An Acceleration reading has been received for a shipment
+ * @param {org.acme.shipping.perishable.AccelReading} AccelReading - the AccelReading transaction
+ * @transaction
+ */
+function AccelReading(AccelReading) {
+    var shipment = AccelReading.shipment;
+    var NS = 'org.acme.shipping.perishable';
+    var contract = shipment.contract;
+    var factory = getFactory();
+
+    //console.log('Adding acceleration ' + AccelReading.accel_x + ' to shipment ' + shipment.$identifier);
+
+    if (shipment.AccelReadings) {
+        shipment.AccelReadings.push(AccelReading);
+    } else {
+        shipment.AccelReadings = [AccelReading];
+    }
+
+    // Also test for accel_y / accel_z
+    if (AccelReading.accel_x < contract.maxAccel ) {
+        var AccelerationEvent = factory.newEvent(NS, 'AccelerationThresholdEvent');
+        AccelerationEvent.shipment = shipment;
+        AccelerationEvent.accel_x = AccelReading.accel_x;
+        AccelerationEvent.accel_y = AccelReading.accel_y;
+        AccelerationEvent.accel_z = AccelReading.accel_z;
+	AccelerationEvent.latitude = AccelReading.latitude;
+        AccelerationEvent.longitude = AccelReading.longitude;
+        AccelerationEvent.readingTime = AccelReading.readingTime;
+        AccelerationEvent.message = 'Acceleration threshold violated! Emitting AccelerationEvent for shipment: ' + shipment.$identifier;
+        emit(AccelerationEvent);
+    }
+
+    return getAssetRegistry(NS + '.Shipment')
+        .then(function (shipmentRegistry) {
+            // add the temp reading to the shipment
+            return shipmentRegistry.update(shipment);
+        });
+}
+
+/**
+ * A GPS reading has been received for a shipment
+ * @param {org.acme.shipping.perishable.GpsReading} gpsReading - the GpsReading transaction
+ * @transaction
+ */
+function gpsReading(gpsReading) {
+
+    var factory = getFactory();
+    var NS = "org.acme.shipping.perishable";
+    var shipment = gpsReading.shipment;
+    var PORT_OF_NEW_YORK = '/LAT:40.6840N/LONG:74.0062W';
+
+    if (shipment.gpsReadings) {
+        shipment.gpsReadings.push(gpsReading);
+    } else {
+        shipment.gpsReadings = [gpsReading];
+    }
+
+    var latLong = '/LAT:' + gpsReading.latitude + gpsReading.latitudeDir + '/LONG:' +
+    gpsReading.longitude + gpsReading.longitudeDir;
+
+    if (latLong == PORT_OF_NEW_YORK) {
+        var shipmentInPortEvent = factory.newEvent(NS, 'ShipmentInPortEvent');
+        shipmentInPortEvent.shipment = shipment;
+        var message = 'Shipment has reached the destination port of ' + PORT_OF_NEW_YORK;
+        shipmentInPortEvent.message = message;
+        emit(shipmentInPortEvent);
+    }
+
+    return getAssetRegistry(NS + '.Shipment')
+    .then(function (shipmentRegistry) {
+        // add the temp reading to the shipment
+        return shipmentRegistry.update(shipment);
     });
-    highestOffer = listing.offers[0];
-    if(highestOffer.bidPrice >= listing.reservePrice) {
-      buyer = highestOffer.member;
-      //seller = listing.owner;
-      // update the balance of the seller
-      seller.balance += highestOffer.bidPrice;
-      // update the balance of the buyer
-      buyer.balance -= highestOffer.bidPrice;
-      // transfer the product to the buyer
-      listing.product.owner = buyer;
-      // Clear the offers
-      //listing.offers = null;
-      // mark the listing as SOLD
-      listing.state = 'SOLD';
-    }
-  }
-  listing.product.owner.products.push(listing.product);
-  return getParticipantRegistry(NS + '.Seller').then(function(sellerRegistry) {
-    // update seller
-    return sellerRegistry.update(seller);
-  }).then(function() {
-    if(listing.state === 'SOLD') {
-      return getParticipantRegistry(NS + '.Member').then(function(memberRegistry) {
-        return memberRegistry.update(buyer);
-      });
-    }
-  }).then(function() {
-    return getAssetRegistry(NS + '.Product');
-  }).then(function(productRegistry) {
-    // remove the listing
-    return productRegistry.update(listing.product);
-  }).then(function() {
-    return getAssetRegistry(NS + '.ProductListing');
-  }).then(function(productListingRegistry) {
-    // remove the listing
-    return productListingRegistry.update(listing);
-  }).then(function() {
-    // Generate event
-    var event = getFactory().newEvent(NS, 'TradeEvent');
-    // Set properties
-    event.type = 'End Auction';
-    event.ownerId = oldOwner;
-    event.id = listing.listingId;
-    event.description = listing.product.description;
-    event.status = listing.state;
-    event.amount = highestOffer.bidPrice;
-    event.buyerId = listing.product.owner.email;
-    // Emit
-    emit(event);
-  });
 }
+
 /**
- * Make an Offer for a ProductListing
- * @param {org.acme.product.auction.Offer} offer - the offer
+ * Initialize some test assets and participants useful for running a demo.
+ * @param {org.acme.shipping.perishable.SetupDemo} setupDemo - the SetupDemo transaction
  * @transaction
  */
-function makeOffer(offer) {
-  var listing = offer.listing;
-  if(listing.state !== 'FOR_SALE') {
-    throw new Error('Listing is not FOR SALE');
-  }
-  if(offer.bidPrice < listing.reservePrice) {
-    throw new Error('Bid amount less than reserve amount!!');
-  }
-  if(offer.member.balance < offer.bidPrice) {
-    throw new Error('Insufficient fund for bid. Please verify the placed bid!!');
-  }
-  return getAssetRegistry(NS + '.ProductListing').then(function(productListingRegistry) {
-    // save the product listing
-    listing.offers.push(offer);
-    return productListingRegistry.update(listing);
-  }).then(function() {
-    // Generate event
-    var event = getFactory().newEvent(NS, 'TradeEvent');
-    // Set properties
-    event.type = 'Offer';
-    event.ownerId = listing.product.owner.email;
-    event.id = listing.listingId;
-    event.description = listing.product.description;
-    event.status = listing.state;
-    event.amount = offer.bidPrice;
-    event.buyerId = offer.member.email;
-    // Emit
-    emit(event);
-  });
-}
-/**
- * Create a new listing
- * @param {org.acme.product.auction.StartBidding} publishListing - the listing transaction
- * @transaction
- */
-function publishListing(listing) {
-  listing.product.owner.products = listing.product.owner.products.filter(function(object) {
-    return object.getIdentifier() !== listing.product.getIdentifier();
-  });
-  var productListing = null;
-  var factory = getFactory();
-  return getAssetRegistry(NS + '.ProductListing').then(function(registry) {
-    // Create the bond asset.
-    productListing = factory.newResource(NS, 'ProductListing', listing.listingId);
-    productListing.reservePrice = listing.reservePrice;
-    productListing.state = 'FOR_SALE';
-    productListing.product = listing.product;
-    productListing.offers = [];
-    // Add the bond asset to the registry.
-    return registry.add(productListing);
-  }).then(function() {
-    return getParticipantRegistry(NS + '.Seller');
-  }).then(function(sellerRegistry) {
-    // save the buyer
-    return sellerRegistry.update(listing.product.owner);
-  }).then(function() {
-    // Generate event
-    var event = factory.newEvent(NS, 'TradeEvent');
-    // Set properties
-    event.type = 'Start Auction';
-    event.ownerId = listing.product.owner.email;
-    event.id = productListing.listingId;
-    event.description = productListing.product.description;
-    event.status = productListing.state;
-    event.amount = productListing.reservePrice;
-    event.buyerId = listing.product.owner.email;
-    // Emit
-    emit(event);
-  });
-}
-/**
- * Add new Product
- * @param {org.acme.product.auction.AddProduct} addProduct - new product addition
- * @transaction
- */
-function addProduct(newproduct) {
-  var product = getFactory().newResource(NS, 'Product', newproduct.productId);
-  product.description = newproduct.description;
-  product.owner = newproduct.owner;
-  if(!product.owner.products) {
-    product.owner.products = [];
-  }
-  product.owner.products.push(product);
-  return getAssetRegistry(NS + '.Product').then(function(registry) {
-    return registry.add(product);
-  }).then(function() {
-    return getParticipantRegistry(NS + '.Seller');
-  }).then(function(sellerRegistry) {
-    return sellerRegistry.update(newproduct.owner);
-  });
+function setupDemo(setupDemo) {
+
+    var factory = getFactory();
+    var NS = 'org.acme.shipping.perishable';
+
+    // create the grower
+    var grower = factory.newResource(NS, 'Grower', 'farmer@email.com');
+    var growerAddress = factory.newConcept(NS, 'Address');
+    growerAddress.country = 'USA';
+    grower.address = growerAddress;
+    grower.accountBalance = 0;
+
+    // create the importer
+    var importer = factory.newResource(NS, 'Importer', 'supermarket@email.com');
+    var importerAddress = factory.newConcept(NS, 'Address');
+    importerAddress.country = 'UK';
+    importer.address = importerAddress;
+    importer.accountBalance = 0;
+
+    // create the shipper
+    var shipper = factory.newResource(NS, 'Shipper', 'shipper@email.com');
+    var shipperAddress = factory.newConcept(NS, 'Address');
+    shipperAddress.country = 'Panama';
+    shipper.address = shipperAddress;
+    shipper.accountBalance = 0;
+
+    // create the contract
+    var contract = factory.newResource(NS, 'Contract', 'CON_002');
+    contract.grower = factory.newRelationship(NS, 'Grower', 'farmer@email.com');
+    contract.importer = factory.newRelationship(NS, 'Importer', 'supermarket@email.com');
+    contract.shipper = factory.newRelationship(NS, 'Shipper', 'shipper@email.com');
+    var tomorrow = setupDemo.timestamp;
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    contract.arrivalDateTime = tomorrow; // the shipment has to arrive tomorrow
+    contract.unitPrice = 0.5; // pay 50 cents per unit
+    contract.minTemperature = 2; // min temperature for the cargo
+    contract.maxTemperature = 10; // max temperature for the cargo
+    contract.maxAccel = 15000; // max acceleration for the cargo
+    contract.minPenaltyFactor = 0.2; // we reduce the price by 20 cents for every degree below the min temp
+    contract.maxPenaltyFactor = 0.1; // we reduce the price by 10 cents for every degree above the max temp
+
+    // create the shipment
+    var shipment = factory.newResource(NS, 'Shipment', '320022000251363131363432');
+    shipment.type = 'MEDICINE';
+    shipment.status = 'IN_TRANSIT';
+    shipment.unitCount = 5000;
+    shipment.contract = factory.newRelationship(NS, 'Contract', 'CON_002');
+    return getParticipantRegistry(NS + '.Grower')
+        .then(function (growerRegistry) {
+            // add the growers
+            return growerRegistry.addAll([grower]);
+        })
+        .then(function() {
+            return getParticipantRegistry(NS + '.Importer');
+        })
+        .then(function(importerRegistry) {
+            // add the importers
+            return importerRegistry.addAll([importer]);
+        })
+        .then(function() {
+            return getParticipantRegistry(NS + '.Shipper');
+        })
+        .then(function(shipperRegistry) {
+            // add the shippers
+            return shipperRegistry.addAll([shipper]);
+        })
+        .then(function() {
+            return getAssetRegistry(NS + '.Contract');
+        })
+        .then(function(contractRegistry) {
+            // add the contracts
+            return contractRegistry.addAll([contract]);
+        })
+        .then(function() {
+            return getAssetRegistry(NS + '.Shipment');
+        })
+        .then(function(shipmentRegistry) {
+            // add the shipments
+            return shipmentRegistry.addAll([shipment]);
+        });
 }
